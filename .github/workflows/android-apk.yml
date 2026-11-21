@@ -1,0 +1,180 @@
+name: Samsung TWRP APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: samsung-twrp-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Samsung TWRP debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The project uses Android Gradle Plugin 8.6.1, which requires Gradle 8.7.
+      # Install Gradle explicitly because some supplied project archives contain
+      # gradle-wrapper.properties but do not contain the gradlew scripts/JAR.
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.7'
+          cache-provider: basic
+
+      - name: Install Android SDK platform 35
+        shell: bash
+        run: |
+          set -eu
+          : "${ANDROID_HOME:?ANDROID_HOME is not set on this runner}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "Android SDK sdkmanager was not found." >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Find Android project (repository folder or ZIP)
+        id: project
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          repo = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          extracted_root = Path(os.environ["RUNNER_TEMP"]) / "samsung-twrp-source"
+          extracted_root.mkdir(parents=True, exist_ok=True)
+
+          def is_project(path: Path) -> bool:
+              has_settings = (path / "settings.gradle").is_file() or (path / "settings.gradle.kts").is_file()
+              has_app_gradle = (path / "app" / "build.gradle").is_file() or (path / "app" / "build.gradle.kts").is_file()
+              return has_settings and has_app_gradle
+
+          def find_projects(base: Path):
+              found = set()
+              if is_project(base):
+                  found.add(base.resolve())
+              for settings_name in ("settings.gradle", "settings.gradle.kts"):
+                  for settings_file in base.rglob(settings_name):
+                      relative_parts = settings_file.relative_to(base).parts
+                      if any(part in {".git", ".gradle", "build"} for part in relative_parts):
+                          continue
+                      candidate = settings_file.parent
+                      if is_project(candidate):
+                          found.add(candidate.resolve())
+              return sorted(found, key=lambda p: (len(p.parts), str(p)))
+
+          projects = find_projects(repo)
+
+          # If only a ZIP was committed, safely extract it and locate the Gradle root.
+          if not projects:
+              zip_files = sorted(p for p in repo.rglob("*.zip") if ".git" not in p.parts)
+              if not zip_files:
+                  raise SystemExit(
+                      "Android project not found. Expected settings.gradle and app/build.gradle, "
+                      "or a ZIP containing those files."
+                  )
+
+              for index, archive_path in enumerate(zip_files):
+                  destination = extracted_root / f"archive_{index}"
+                  destination.mkdir(parents=True, exist_ok=True)
+                  with zipfile.ZipFile(archive_path) as archive:
+                      for item in archive.infolist():
+                          name = item.filename.replace("\\", "/")
+                          member = Path(name)
+                          if member.is_absolute() or ".." in member.parts:
+                              raise SystemExit(f"Unsafe ZIP entry rejected: {item.filename}")
+                          target = (destination / member).resolve()
+                          if target != destination.resolve() and destination.resolve() not in target.parents:
+                              raise SystemExit(f"Unsafe ZIP entry rejected: {item.filename}")
+                          if item.is_dir():
+                              target.mkdir(parents=True, exist_ok=True)
+                          else:
+                              target.parent.mkdir(parents=True, exist_ok=True)
+                              with archive.open(item) as source, target.open("wb") as output:
+                                  shutil.copyfileobj(source, output)
+
+              projects = find_projects(extracted_root)
+
+          if not projects:
+              raise SystemExit(
+                  "No Android Gradle project was found. Check that the ZIP/repository contains "
+                  "settings.gradle and app/build.gradle."
+              )
+          if len(projects) > 1:
+              listing = "\n".join(str(path) for path in projects)
+              raise SystemExit("More than one Android project was found; refusing to guess:\n" + listing)
+
+          project_dir = str(projects[0])
+          print(f"Android project root: {project_dir}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"project_dir={project_dir}\n")
+          PY
+
+      - name: Build debug APK
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Building project at: $PROJECT_DIR"
+          gradle --no-daemon --stacktrace --console=plain \
+            --project-dir "$PROJECT_DIR" \
+            :app:assembleDebug
+
+      - name: Prepare APK artifact
+        id: apk
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
+          APK_FILE="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -print | sort | head -n 1)"
+          if [[ -z "$APK_FILE" ]]; then
+            echo "Build completed but no debug APK was found in: $APK_DIR" >&2
+            exit 1
+          fi
+          OUTPUT_DIR="$RUNNER_TEMP/samsung-twrp-apk"
+          mkdir -p "$OUTPUT_DIR"
+          OUTPUT_APK="$OUTPUT_DIR/Samsung-TWRP-Tool-debug.apk"
+          cp "$APK_FILE" "$OUTPUT_APK"
+          echo "apk_path=$OUTPUT_APK" >> "$GITHUB_OUTPUT"
+          echo "APK ready: $OUTPUT_APK"
+          ls -lh "$OUTPUT_APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: Samsung-TWRP-Tool-debug-APK
+          path: ${{ steps.apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 14
+          
