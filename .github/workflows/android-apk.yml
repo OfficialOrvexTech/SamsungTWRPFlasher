@@ -37,7 +37,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.7'
-          cache-provider: basic
+          cache-provider: true
 
       - name: Install Android SDK platform 35
         shell: bash
